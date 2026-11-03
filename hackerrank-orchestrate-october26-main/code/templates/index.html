@@ -1,0 +1,250 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ghost Data | Deletion Audit</title>
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-shell">
+    <aside class="sidebar">
+        <a class="brand" href="/">
+            <span class="brand-icon">G</span>
+            <span>
+                <strong>Ghost Data</strong>
+                <small>Deletion Audit</small>
+            </span>
+        </a>
+
+        <p class="nav-heading">WORKSPACE</p>
+        <a class="nav-link active" href="#overview">▦ &nbsp; Audit overview</a>
+        <a class="nav-link" href="#case-results">◷ &nbsp; Case results</a>
+
+        <div class="sidebar-bottom">
+            <span class="live-dot"></span> Local audit workspace
+            <small>Your files stay on this computer</small>
+        </div>
+    </aside>
+
+    <main class="main-content">
+        <header class="topbar">
+            <span>GHOST DATA / AUDIT WORKSPACE</span>
+            <span class="local-label">● LOCAL MODE</span>
+        </header>
+
+        <section class="page-heading" id="overview">
+            <div>
+                <p class="eyebrow">HACKERRANK ORCHESTRATE · OCTOBER 2026</p>
+                <h1>Deletion audit <span>overview</span></h1>
+                <p class="subtitle">
+                    Compare expected benchmark results with your engine output.
+                </p>
+            </div>
+
+            <form action="{{ url_for('run_engine') }}" method="post">
+                <button class="button primary" type="submit">
+                    ▶ &nbsp; Run analysis engine
+                </button>
+            </form>
+        </section>
+
+        {% for category, message in get_flashed_messages(with_categories=true) %}
+        <div class="notice {{ category }}">
+            <strong>{{ category|upper }}</strong>
+            <pre>{{ message }}</pre>
+        </div>
+        {% endfor %}
+
+        {% if not dataset_found %}
+        <div class="notice error">
+            <strong>DATASET NOT FOUND</strong>
+            <p>Expected file: dataset/sample_output.csv</p>
+            <p>Check that the dataset folder is beside the code folder.</p>
+        </div>
+        {% elif not actual_found %}
+        <div class="notice warning">
+            <strong>ACTUAL OUTPUT NOT FOUND</strong>
+            <p>
+                The benchmark was found, but no actual output CSV was found.
+                Run the analysis engine, then refresh this dashboard.
+            </p>
+        </div>
+        {% else %}
+        <div class="file-info">
+            Reading actual results from <code>{{ actual_file }}</code>
+        </div>
+        {% endif %}
+
+        <section class="stats">
+            <article class="stat-card">
+                <span class="stat-label">TOTAL CASES</span>
+                <strong class="stat-number">{{ total }}</strong>
+                <span class="stat-description">Expected benchmark cases</span>
+            </article>
+
+            <article class="stat-card">
+                <span class="stat-label">STATUS MATCHES</span>
+                <strong class="stat-number">{{ status_matches }}
+                    <small>/ {{ processed }}</small>
+                </strong>
+                <span class="stat-description">Expected vs actual status</span>
+            </article>
+
+            <article class="stat-card">
+                <span class="stat-label">STEP MATCHES</span>
+                <strong class="stat-number">{{ step_matches }}
+                    <small>/ {{ processed }}</small>
+                </strong>
+                <span class="stat-description">Verification steps match</span>
+            </article>
+
+            <article class="stat-card">
+                <span class="stat-label">CASES TO REVIEW</span>
+                <strong class="stat-number red-text">{{ review_count }}</strong>
+                <span class="stat-description">Status or step differences</span>
+            </article>
+        </section>
+
+        <section class="panel" id="case-results">
+            <div class="panel-heading">
+                <div>
+                    <h2>Case results</h2>
+                    <p>Search, filter and inspect individual cases.</p>
+                </div>
+                <input id="search" type="search"
+                       placeholder="Search case ID..."
+                       aria-label="Search case ID">
+            </div>
+
+            <div class="filter-bar">
+                <button type="button" class="filter active" data-filter="all">
+                    All cases
+                </button>
+                <button type="button" class="filter" data-filter="mismatch">
+                    Mismatches
+                </button>
+                <button type="button" class="filter" data-filter="match">
+                    Matches
+                </button>
+                <button type="button" class="filter" data-filter="pending">
+                    Not run
+                </button>
+            </div>
+
+            <div class="table-scroll">
+                <table id="case-table">
+                    <thead>
+                    <tr>
+                        <th>CASE ID</th>
+                        <th>EXPECTED</th>
+                        <th>ACTUAL</th>
+                        <th>RESULT</th>
+                        <th>STEPS</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    {% for c in cases %}
+                    <tr data-pending="{{ 'true' if not c.has_actual else 'false' }}"
+                        data-match="{{ 'true' if c.status_match and c.steps_match else 'false' }}">
+                        <td class="case-id">{{ c.case_id }}</td>
+                        <td><span class="status-chip">{{ c.expected }}</span></td>
+                        <td>
+                            <span class="status-chip {% if not c.has_actual %}muted{% endif %}">
+                                {{ c.actual }}
+                            </span>
+                        </td>
+                        <td>
+                            {% if not c.has_actual %}
+                                <span class="result pending">● Not run</span>
+                            {% elif c.status_match and c.steps_match %}
+                                <span class="result good">● Match</span>
+                            {% else %}
+                                <span class="result bad">● Review needed</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <details>
+                                <summary>Inspect</summary>
+                                <div class="step-detail">
+                                    <strong>Expected steps</strong>
+                                    <pre>{{ c.expected_steps or "Not provided" }}</pre>
+                                    <strong>Actual steps</strong>
+                                    <pre>{{ c.steps or "Not available" }}</pre>
+                                </div>
+                            </details>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="empty-state">
+                            No benchmark cases found in the CSV.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+                <p id="no-results" class="empty-state" hidden>
+                    No cases match your search or filter.
+                </p>
+            </div>
+
+            <div class="table-footer">
+                <span>LOCAL CSV RESULTS</span>
+                <span>{{ processed }} of {{ total }} cases have actual results</span>
+            </div>
+        </section>
+
+        <footer>
+            <span>GHOST DATA · Evidence-driven deletion audit</span>
+            <span>LOCAL WORKSPACE</span>
+        </footer>
+    </main>
+</div>
+
+<script>
+    const searchInput = document.getElementById("search");
+    const filterButtons = document.querySelectorAll(".filter");
+    const rows = [...document.querySelectorAll("#case-table tbody tr[data-pending]")];
+    const noResults = document.getElementById("no-results");
+    let currentFilter = "all";
+
+    function filterCases() {
+        const query = searchInput.value.toLowerCase().trim();
+        let visibleCount = 0;
+
+        rows.forEach(row => {
+            const pending = row.dataset.pending === "true";
+            const match = row.dataset.match === "true";
+            const textMatch = row.innerText.toLowerCase().includes(query);
+
+            let filterMatch = true;
+            if (currentFilter === "pending") filterMatch = pending;
+            if (currentFilter === "match") filterMatch = !pending && match;
+            if (currentFilter === "mismatch") filterMatch = !pending && !match;
+
+            const visible = textMatch && filterMatch;
+            row.hidden = !visible;
+            if (visible) visibleCount++;
+        });
+
+        noResults.hidden = visibleCount !== 0;
+    }
+
+    searchInput.addEventListener("input", filterCases);
+
+    filterButtons.forEach(button => {
+        button.addEventListener("click", () => {
+            currentFilter = button.dataset.filter;
+
+            filterButtons.forEach(item => item.classList.remove("active"));
+            button.classList.add("active");
+
+            filterCases();
+        });
+    });
+</script>
+</body>
+</html>

@@ -1,0 +1,596 @@
+﻿#!/usr/bin/env python3
+"""Evidence-driven deletion audit pipeline for Ghost Data Still Exists.
+
+Uses participant-facing dataset files only. Optional pdftotext/tesseract binaries
+improve extraction of PDF/image evidence; the core CSV/JSON/SQL/log path uses
+Python's standard library.
+"""
+from __future__ import annotations
+import csv, hashlib, json, logging, re, sqlite3, subprocess, sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+ROOT = Path(__file__).resolve().parents[1]
+DATASET = ROOT / "dataset"
+OUTPUT = ROOT / "output.csv"
+LOG = logging.getLogger("ghostguard")
+
+PHASE_ORDER = {"FINDING": 0, "REMEDIATION": 1, "VERIFICATION": 2}
+OP_ORDER = {
+    "REPORT_REMAINING_RECORD": 0, "REPORT_EXPOSED_PII": 1,
+    "REPORT_ACTIVE_DATA_FLOW": 2, "REPORT_RESTORE_RISK": 3,
+    "DISABLE_DATA_FLOW": 0, "BLOCK_RESTORE": 1, "DELETE_RECORD": 2,
+    "REDACT_RECORD": 3, "ANONYMIZE_RECORD": 4,
+    "VERIFY_RECORD_ABSENT": 0, "VERIFY_RECORD_PRESENT": 1,
+    "VERIFY_RECORD_REDACTED": 2, "VERIFY_RECORD_ANONYMIZED": 3,
+    "VERIFY_DATA_FLOW_DISABLED": 4, "VERIFY_RESTORE_BLOCKED": 5,
+}
+OP_STATE = {
+    "REPORT_REMAINING_RECORD": ("FINDING", "PRESENT"),
+    "REPORT_EXPOSED_PII": ("FINDING", "PRESENT"),
+    "REPORT_ACTIVE_DATA_FLOW": ("FINDING", "ACTIVE"),
+    "REPORT_RESTORE_RISK": ("FINDING", "ACTIVE"),
+    "DISABLE_DATA_FLOW": ("REMEDIATION", "DISABLED"),
+    "BLOCK_RESTORE": ("REMEDIATION", "BLOCKED"),
+    "DELETE_RECORD": ("REMEDIATION", "ABSENT"),
+    "REDACT_RECORD": ("REMEDIATION", "REDACTED"),
+    "ANONYMIZE_RECORD": ("REMEDIATION", "ANONYMIZED"),
+    "VERIFY_RECORD_ABSENT": ("VERIFICATION", "ABSENT"),
+    "VERIFY_RECORD_PRESENT": ("VERIFICATION", "PRESENT"),
+    "VERIFY_RECORD_REDACTED": ("VERIFICATION", "REDACTED"),
+    "VERIFY_RECORD_ANONYMIZED": ("VERIFICATION", "ANONYMIZED"),
+    "VERIFY_DATA_FLOW_DISABLED": ("VERIFICATION", "DISABLED"),
+    "VERIFY_RESTORE_BLOCKED": ("VERIFICATION", "BLOCKED"),
+}
+
+@dataclass
+class Observation:
+    file_id: str
+    captured_at: str
+    observed_at: str
+    system_id: str
+    resource_id: str
+    category: str
+    fields: dict[str, Any] = field(default_factory=dict)
+    raw: str = ""
+    explicit_state: str = ""
+    _search_cache: str = field(default="", repr=False)
+    _digits_cache: str = field(default="", repr=False)
+
+    def searchable(self) -> str:
+        if not self._search_cache:
+            vals = [self.resource_id, self.system_id, self.category, self.raw]
+            vals += [str(k) + " " + str(v) for k, v in self.fields.items() if v is not None]
+            self._search_cache = " ".join(vals).casefold()
+        return self._search_cache
+
+    def digits(self) -> str:
+        if not self._digits_cache:
+            self._digits_cache = re.sub(r"\D", "", self.searchable())
+        return self._digits_cache
+
+
+def parse_dt(value: Any) -> datetime | None:
+    if not value: return None
+    try:
+        s = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError): return None
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (dict, list)): out.update(flatten(v, key))
+            else: out[key] = v
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj): out.update(flatten(v, f"{prefix}[{i}]"))
+    else: out[prefix] = obj
+    return out
+
+
+def infer_system(value: str, path_hint: str = "") -> str:
+    # Prefer explicit service/system identifiers over incidental words in log text.
+    s = value.casefold()
+    explicit = ["account_service", "search_service", "analytics_platform", "support_platform",
+                "export_service", "integration_service", "backup_service", "security_service",
+                "identity_service", "marketing_service", "cache_service", "email_delivery_service"]
+    for name in explicit:
+        if re.search(r"\b" + re.escape(name) + r"\b", s): return name
+    hint = path_hint.casefold()
+    for needle, system in [("search", "search_service"), ("analytics", "analytics_platform"),
+                           ("support", "support_platform"), ("export", "export_service"),
+                           ("backup", "backup_service"), ("restore", "backup_service"),
+                           ("connector", "integration_service"), ("integration", "integration_service"),
+                           ("security", "security_service"), ("tombstone", "identity_service"),
+                           ("identity", "identity_service"), ("cache", "cache_service"),
+                           ("marketing", "marketing_service"), ("email_delivery", "email_delivery_service"),
+                           ("account", "account_service")]:
+        if needle in hint: return system
+    return "unknown_system"
+
+
+def infer_category(collection: str, fields: dict[str, Any], system: str) -> str:
+    s = (collection + " " + system + " " + " ".join(fields.keys())).casefold()
+    if "tombstone" in s: return "ACCOUNT_TOMBSTONE"
+    if "security_audit" in s or "audit_record" in s or system == "security_service": return "SECURITY_AUDIT_LOG"
+    if "legal_hold" in s or "legal" in s: return "LEGAL_HOLD_RECORD"
+    if "backup" in s or "restore" in s: return "BACKUP_ARCHIVE"
+    if "search" in s or "index" in s: return "SEARCH_INDEX_ENTRY"
+    if "cache" in s: return "CACHE_ENTRY"
+    if "support_attachment" in s or "attachment" in s: return "SUPPORT_ATTACHMENT"
+    if "support" in s or "ticket" in s or "message" in s: return "SUPPORT_MESSAGE"
+    if "analytics" in s: return "ANALYTICS_PROFILE"
+    if "telemetry" in s: return "PRODUCT_TELEMETRY"
+    if "export" in s: return "USER_EXPORT"
+    if "marketing" in s: return "MARKETING_PROFILE"
+    if "email_delivery" in s or "notification" in s: return "EMAIL_DELIVERY_LOG"
+    if "customer_profile" in s or system == "account_service": return "USER_PROFILE"
+    if "identifier" in s: return "SECONDARY_IDENTIFIER"
+    return "UNKNOWN"
+
+
+def build_observations(dataset: Path) -> tuple[list[Observation], dict[str, dict[str, str]]]:
+    manifest_rows = read_csv(dataset / "evidence_files.csv")
+    manifest = {r["file_path"]: r for r in manifest_rows}
+    obs: list[Observation] = []
+    evroot = dataset / "evidence"
+    for rel, meta in manifest.items():
+        path = dataset / rel
+        if not path.is_file(): continue
+        fid, captured = meta["file_id"], meta["captured_at"]
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".json":
+                root = json.loads(path.read_text(encoding="utf-8"))
+                def walk(node: Any, sysctx: str = "", colctx: str = "", timectx: str = "", parentraw: str = ""):
+                    if isinstance(node, dict):
+                        sys_here = str(node.get("data_store") or node.get("origin_system") or node.get("system_id") or sysctx)
+                        col_here = str(node.get("collection") or node.get("collection_name") or node.get("record_type") or colctx)
+                        time_here = str(node.get("observed_at") or node.get("captured_at") or node.get("updated_at") or node.get("recorded_at") or timectx or captured)
+                        if node.get("resource_id") and re.fullmatch(r"(?:account|search|support|export|backup|analytics|data_flow|audit_record|tombstone|cache|marketing|email_delivery|profile|record)_\d+", str(node.get("resource_id")), re.I):
+                            fields = flatten(node)
+                            system = infer_system(sys_here, col_here + " " + path.name)
+                            category = infer_category(col_here + " " + str(node.get("resource_id", "")), fields, system)
+                            state = ""
+                            if node.get("status_code") == 404 or node.get("profile", "MISSING") is None: state = "ABSENT"
+                            elif node.get("enabled") is False or node.get("restore_allowed") is False: state = "DISABLED" if "connector" in (col_here+sys_here).lower() else "BLOCKED"
+                            elif node.get("enabled") is True: state = "ACTIVE"
+                            elif node.get("restore_allowed") is True: state = "ACTIVE"
+                            obs.append(Observation(fid,captured,time_here,system,str(node["resource_id"]),category,fields,json.dumps(node,ensure_ascii=False),state))
+                        for k,v in node.items():
+                            nsys = str(k) if k in {"account_service","search_service","analytics_platform","support_platform","export_service","integration_service","backup_service","security_service","identity_service","marketing_service","cache_service"} else sys_here
+                            walk(v, nsys, col_here if k != "records" else col_here, time_here, parentraw)
+                    elif isinstance(node,list):
+                        for v in node: walk(v,sysctx,colctx,timectx,parentraw)
+                walk(root)
+            elif suffix == ".sql":
+                con = sqlite3.connect(":memory:")
+                try:
+                    con.executescript(path.read_text(encoding="utf-8",errors="replace"))
+                    for (table,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                        cur=con.execute(f'SELECT * FROM "{table.replace(chr(34), chr(34)*2)}"')
+                        cols=[d[0] for d in cur.description]
+                        for row in cur.fetchall():
+                            fields=dict(zip(cols,row)); resource=fields.get("resource_id")
+                            if not resource or not re.fullmatch(r"(?:account|search|support|export|backup|analytics|data_flow|audit_record|tombstone|cache|marketing|email_delivery|profile|record)_\d+", str(resource), re.I): continue
+                            payload=fields.get("record_json")
+                            if payload:
+                                try: fields.update(flatten(json.loads(payload)))
+                                except Exception: pass
+                            system=infer_system(str(fields.get("origin_system", "")), table + " " + path.name)
+                            category=infer_category(str(fields.get("collection_name",table)) + " " + str(resource),fields,system)
+                            t=str(fields.get("updated_at") or fields.get("captured_at") or captured)
+                            state=""
+                            if fields.get("restore_allowed") in (0,False): state="BLOCKED"
+                            elif fields.get("restore_allowed") in (1,True): state="ACTIVE"
+                            elif fields.get("enabled") in (0,False): state="DISABLED"
+                            elif fields.get("enabled") in (1,True): state="ACTIVE"
+                            obs.append(Observation(fid,captured,t,system,str(resource),category,fields,json.dumps(fields,ensure_ascii=False,default=str),state))
+                finally: con.close()
+            else:
+                if suffix == ".pdf":
+                    cp=subprocess.run(["pdftotext","-layout",str(path),"-"],capture_output=True,text=True,timeout=15)
+                    text=cp.stdout or ""
+                elif suffix in (".png", ".jpg", ".jpeg"):
+                    cp=subprocess.run(["tesseract",str(path),"stdout"],capture_output=True,text=True,timeout=20)
+                    text=cp.stdout or ""
+                else: text=path.read_text(encoding="utf-8",errors="replace")
+                for line in text.splitlines():
+                    # Resource IDs in this dataset use a known prefix followed by a numeric suffix.
+                    rmatch=re.search(r'\b(?:account|search|support|export|backup|analytics|data_flow|audit_record|tombstone|cache|marketing|email_delivery|profile|record|email_delivery)_[0-9]+\b',line,re.I)
+                    if not rmatch: continue
+                    rid=rmatch.group(0).rstrip('.,;')
+                    sysm=re.search(r'\b(?:service|system|data_store)[=: ]+([A-Za-z_]+)',line,re.I)
+                    system=infer_system((sysm.group(1) if sysm else "")+" "+line,path.name)
+                    category=infer_category(path.name + " " + rid,{},system)
+                    low=line.casefold()
+                    state=""
+                    if any(token in low for token in ("http_status=404", "status_code=404", "rows=0", "result=miss", "profile=null", "result=not_found", "rows: 0")):
+                        state="ABSENT"
+                    elif any(token in low for token in ("http_status=200", "status_code=200", "result=hit", "rows=1", "result=present")):
+                        state="PRESENT"
+                    if system == "integration_service":
+                        if re.search(r"\benabled[=: ]+true\b", low) or "enabled=true" in low: state="ACTIVE"
+                        elif re.search(r"\benabled[=: ]+false\b", low) or "enabled=false" in low: state="DISABLED"
+                    if system == "backup_service":
+                        if re.search(r"\brestore_allowed[=: ]+true\b", low): state="ACTIVE"
+                        elif re.search(r"\brestore_allowed[=: ]+false\b", low): state="BLOCKED"
+                    obs.append(Observation(fid,captured,captured,system,rid,category,{},line,state))
+        except Exception as e:
+            LOG.warning("Could not parse %s (%s): %s", rel, suffix, e)
+    return obs, {r["file_id"]:r for r in manifest_rows}
+
+
+def email_hash(email: str) -> str:
+    return hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
+
+
+def is_deletion_request(text: str) -> bool:
+    t=text.casefold()
+    if re.search(r"\b(do not delete|don't delete|not requesting deletion|without deleting)\b", t):
+        return False
+    # Explicit non-deletion intents take precedence unless the request also plainly asks
+    # to erase the account/personal data. Verification of a prior deletion counts as in-scope.
+    nondelete = [r"\b(correct|correction|update|change|rectify|rectification)\b.{0,90}\b(email|address|phone|details|data|profile)\b",
+                 r"\b(access|view|download|export|copy of)\b.{0,70}\b(my )?(data|information|records)\b",
+                 r"\b(marketing|promotional|newsletter|unsubscribe|opt.?out|stop sending)\b",
+                 r"\b(do not delete|don't delete|not requesting deletion|without deleting)\b"]
+    deletion = [r"\bdelet\w*\b",r"\beras\w*\b",r"\bremov\w*\b.{0,90}\b(profile|account|personal|data|details|information|cop(?:y|ies)|records?|traces|search result)\b",
+                r"\bclose\w*\b.{0,60}\b(account|profile)\b",r"\bpermanent account\b",r"\baccount.{0,45}\b(closed|deleted|erased|removed)\b",
+                r"\b(elimin\w*)\b",r"\bsupprimer\b",r"\bsuppression\b.{0,70}\b(compte|définitive|données)\b",r"\bexclus[aã]o\b",r"\bexclus[aã]o permanente\b",r"삭제",r"제거",
+                r"\bverwijder\w*\b",r"\blöschen\b",r"\bentfernen\b",r"\bcancellare\b",r"\brimuovere\b",r"削除",r"アカウント.{0,20}削除",r"删除",r"удалить"]
+    has_delete=any(re.search(p,t) for p in deletion)
+    if any(re.search(p,t) for p in nondelete) and not has_delete: return False
+    # A verification request refers to an existing deletion and should be audited.
+    if re.search(r"\b(verify|check|audit|confirm|investigate|inspect)\b.{0,120}\b(deletion|deleted|erased|removed|gone|account|profile)\b",t): return True
+    return has_delete
+
+
+def resolve_identity(email: str, audit_at: str, identities: list[dict[str,str]], audits: list[dict[str,str]]) -> tuple[str, set[str], set[str], set[str]]:
+    target=email.strip().casefold(); audit=parse_dt(audit_at)
+    users: dict[str,dict[str,set[str]]] = defaultdict(lambda: defaultdict(set))
+    for r in identities:
+        uid=r.get("user_id","")
+        for fieldname in ("email","phone","name","email_hash"):
+            v=r.get(fieldname,"").strip()
+            if v: users[uid][fieldname].add(v)
+        if r.get("email"): users[uid]["email_hash"].add(email_hash(r["email"]))
+    # Historical old/new values remain useful for finding residual copies.
+    for a in audits:
+        uid=a.get("user_id",""); fld=a.get("field_name","").casefold()
+        ev=parse_dt(a.get("event_time"))
+        if audit and ev and ev > audit: continue
+        if fld in ("email","phone","name","email_hash"):
+            for k in ("old_value","new_value"):
+                v=a.get(k,"").strip()
+                if v: users[uid][fld].add(v)
+            if fld=="email":
+                for k in ("old_value","new_value"):
+                    if a.get(k): users[uid]["email_hash"].add(email_hash(a[k]))
+    candidates=[]
+    for uid, fields in users.items():
+        if any(target==v.casefold() for v in fields["email"]): candidates.append(uid)
+    if len(candidates)>1:
+        # Prefer the current identity record when its update is no later than the audit cutoff.
+        current={r['user_id']:r for r in identities}
+        valid=[u for u in candidates if u in current and (not audit or not parse_dt(current[u].get('updated_at')) or parse_dt(current[u].get('updated_at'))<=audit)]
+        candidates=valid or candidates
+    uid=candidates[0] if len(candidates)==1 else (candidates[0] if candidates else "")
+    if not uid: return "",{target},{email_hash(email)},set()
+    emails={v.casefold() for v in users[uid]["email"] if v}
+    phones={re.sub(r"\D","",v) for v in users[uid]["phone"] if v}
+    names={re.sub(r"[^a-z0-9]","",v.casefold()) for v in users[uid]["name"] if v}
+    hashes={v.casefold() for v in users[uid]["email_hash"] if v}
+    emails.add(target); hashes.add(email_hash(email))
+    aliases=emails|hashes|phones|names|{uid.casefold()}
+    return uid, aliases, emails, phones
+
+
+def matches_user(o: Observation, uid: str, aliases: set[str], emails: set[str], phones: set[str], audit_at: str) -> bool:
+    cap=parse_dt(o.captured_at); audit=parse_dt(audit_at); observed=parse_dt(o.observed_at)
+    if audit and cap and cap>audit: return False
+    if audit and observed and observed>audit: return False
+    hay=o.searchable()
+    # Exact email/hash matching is fast and avoids accidental partial identity matches.
+    if any(e and e in hay for e in emails): return True
+    if any(len(h)==64 and h in hay for h in aliases): return True
+    if uid and re.search(r"(?<![a-z0-9_])" + re.escape(uid.casefold()) + r"(?![a-z0-9_])", hay): return True
+    # Names are a secondary matching signal for scanned business documents; require a full normalized name.
+    normalized = re.sub(r"[^a-z0-9]", "", hay)
+    for alias in aliases:
+        if alias.isalpha() and len(alias) >= 9 and alias in normalized: return True
+    if phones:
+        digits=o.digits()
+        if any(len(p)>=8 and p in digits for p in phones): return True
+    return False
+
+
+def latest_by_resource(observations: list[Observation]) -> dict[tuple[str,str], Observation]:
+    out={}
+    for o in observations:
+        key=(o.system_id,o.resource_id)
+        dt=parse_dt(o.observed_at) or parse_dt(o.captured_at) or datetime.min.replace(tzinfo=timezone.utc)
+        old=out.get(key)
+        olddt=(parse_dt(old.observed_at) or parse_dt(old.captured_at)) if old else None
+        if old is None or olddt is None or dt>=olddt: out[key]=o
+    return out
+
+
+def policy_action(category: str, fields: dict[str,Any], rules: list[dict[str,str]] | None = None, audit_at: str = "") -> str:
+    """Apply the supplied policy table, using category-specific conditions where needed."""
+    cat=category.upper()
+    candidates=[r for r in (rules or []) if r.get("data_category", "").upper()==cat]
+    if candidates:
+        for rule in candidates:
+            condition=rule.get("condition", "").casefold()
+            flat={str(k).split('.')[-1].split('[')[0].casefold():str(v).casefold() for k,v in fields.items() if v is not None}
+            if cat=="SUPPORT_MESSAGE":
+                text=" ".join(flat.values())
+                # The rule requires redaction when a conversation contains shared
+                # customer/agent/order context. Flattened evidence often phrases this
+                # as separate words rather than the exact full condition string.
+                shared_context = (
+                    "shared" in text
+                    or "another customer" in text
+                    or "other customer" in text
+                    or "agent" in text
+                    or "order context" in text
+                    or ("order" in text and "customer" in text)
+                    or "must be retained" in text
+                    or "retain context" in text
+                )
+                if shared_context:
+                    return rule.get("required_action", "REDACT")
+                # If the evidence doesn't establish shared context, don't silently
+                # turn this conditional rule into a DELETE action. Redaction is the
+                # conservative privacy-preserving action for support conversations.
+                return "REDACT"
+            if cat in ("ANALYTICS_PROFILE", "PRODUCT_TELEMETRY"):
+                # Keep the policy action as ANONYMIZE; case-level logic verifies whether
+                # the current record is already de-identified or still attributable.
+                return rule.get("required_action", "ANONYMIZE")
+            if cat=="SECURITY_AUDIT_LOG":
+                until=field_value(fields,("retention_until",))
+                cutoff=parse_dt(audit_at) if audit_at else None
+                # Compare retention against the case's audit time, not wall-clock time.
+                if not until or not parse_dt(until) or not cutoff or parse_dt(until)>cutoff:
+                    return rule.get("required_action", "RETAIN")
+                continue
+            if cat=="LEGAL_HOLD_RECORD":
+                active=flat.get("active",flat.get("legal_hold_active",""))
+                if active in ("true","1","yes","active"): return rule.get("required_action", "UNKNOWN")
+                continue
+            if cat=="BACKUP_ARCHIVE":
+                # Backups may be retained if restore access is blocked; separately report
+                # a risk when restore remains allowed.
+                return rule.get("required_action", "RETAIN")
+            if cat=="ACCOUNT_TOMBSTONE":
+                return rule.get("required_action", "UNKNOWN")
+            if condition in ("always", ""):
+                return rule.get("required_action", "UNKNOWN")
+        return "DELETE"
+    # Safe fallback for unfamiliar policy categories; normal dataset categories are table-driven above.
+    if cat in ("USER_PROFILE","SECONDARY_IDENTIFIER","SEARCH_INDEX_ENTRY","CACHE_ENTRY","SUPPORT_ATTACHMENT","USER_EXPORT","MARKETING_PROFILE"): return "DELETE"
+    if cat in ("SUPPORT_MESSAGE","EMAIL_DELIVERY_LOG","ACCOUNT_TOMBSTONE"): return "REDACT"
+    if cat in ("ANALYTICS_PROFILE","PRODUCT_TELEMETRY"): return "ANONYMIZE"
+    if cat in ("BACKUP_ARCHIVE","SECURITY_AUDIT_LOG","LEGAL_HOLD_RECORD"): return "RETAIN"
+    return "UNKNOWN"
+
+
+def field_value(fields: dict[str,Any], suffixes: Iterable[str]) -> Any:
+    for k,v in fields.items():
+        if k.split('.')[-1].split('[')[0].casefold() in {s.casefold() for s in suffixes}: return v
+    return None
+
+
+def is_pii_exposed(o: Observation, emails: set[str], phones: set[str], aliases: set[str]) -> bool:
+    f={str(k).split('.')[-1].split('[')[0].casefold():str(v).casefold() for k,v in o.fields.items() if v is not None}
+    for k in ("email","requester_email","owner_email","customer_email","phone","requester_phone","owner_phone","full_name","name","email_hash"):
+        v=f.get(k)
+        if not v or v in ("null","none","", "redacted"): continue
+        if k in ("email","requester_email","owner_email","customer_email") and v in emails: return True
+        if k in ("phone","requester_phone","owner_phone") and re.sub(r'\D','',v) in {re.sub(r'\D','',p) for p in phones}: return True
+        if k=="email_hash" and v in aliases: return True
+        if k in ("full_name","name") and re.sub(r'[^a-z0-9]','',v) in aliases: return True
+    # OCR and logs may have only the direct identifier in raw text.
+    raw=o.raw.casefold()
+    return any(e in raw for e in emails if e) or any(re.sub(r'\D','',p) in re.sub(r'\D','',raw) for p in phones if len(re.sub(r'\D','',p))>=8)
+
+
+def make_step(op: str, system: str, resource: str, evidence_id: str) -> dict[str,Any]:
+    phase,state=OP_STATE[op]
+    return {"step_no":0,"phase":phase,"system_id":system,"resource_id":resource,"operation":op,"state":state,"evidence_id":evidence_id}
+
+
+def sort_steps(steps: list[dict[str,Any]]) -> list[dict[str,Any]]:
+    steps.sort(key=lambda s:(PHASE_ORDER[s['phase']],OP_ORDER[s['operation']],s['system_id'],s['resource_id']))
+    for i,s in enumerate(steps,1): s['step_no']=i
+    return steps
+
+
+def case_output(req: dict[str,str], observations: list[Observation], identities: list[dict[str,str]], audits: list[dict[str,str]], activities: list[dict[str,str]], rules: list[dict[str,str]]) -> dict[str,str]:
+    case_id=req['case_id']; audit_at=req['audit_at']; email=req['email']
+    if not is_deletion_request(req.get('request_text','')):
+        return {"case_id":case_id,"deletion_status":"NOT_APPLICABLE","steps_json":"[]"}
+    uid, aliases, emails, phones=resolve_identity(email,audit_at,identities,audits)
+    matched=[o for o in observations if matches_user(o,uid,aliases,emails,phones,audit_at)]
+    latest=latest_by_resource(matched)
+    # Exclude unknown categories and observations that are merely an identifier mention with no useful resource facts.
+    resources=[]
+    for (system,rid),o in latest.items():
+        if o.category!="UNKNOWN": resources.append(o)
+    findings=[]; remediation=[]; verifications=[]
+    account_resources=[o for o in resources if o.system_id=="account_service" or o.category=="USER_PROFILE"]
+    # A direct account lookup can be explicitly absent.
+    for o in resources:
+        action=policy_action(o.category,o.fields,rules,audit_at)
+        # An explicit not-found/404 result is positive verification evidence, not
+        # a reason to discard the resource. Preserve it as a completed verification.
+        if o.explicit_state=="ABSENT":
+            if action == "DELETE" or o.category in ("USER_PROFILE", "SECONDARY_IDENTIFIER", "SEARCH_INDEX_ENTRY", "CACHE_ENTRY", "SUPPORT_ATTACHMENT", "USER_EXPORT", "MARKETING_PROFILE"):
+                verifications.append(make_step("VERIFY_RECORD_ABSENT", o.system_id, o.resource_id, o.file_id))
+            elif action == "REDACT":
+                verifications.append(make_step("VERIFY_RECORD_REDACTED", o.system_id, o.resource_id, o.file_id))
+            elif action == "ANONYMIZE":
+                verifications.append(make_step("VERIFY_RECORD_ANONYMIZED", o.system_id, o.resource_id, o.file_id))
+            elif action == "RETAIN":
+                verifications.append(make_step("VERIFY_RECORD_PRESENT", o.system_id, o.resource_id, o.file_id))
+            continue
+        fields={str(k).split('.')[-1].split('[')[0].casefold():v for k,v in o.fields.items()}
+        if action=="DELETE":
+            present=not (field_value(o.fields,("status_code",))==404 or field_value(o.fields,("profile",)) is None and "profile" in o.fields)
+            if present:
+                findings.append(make_step("REPORT_REMAINING_RECORD",o.system_id,o.resource_id,o.file_id))
+                remediation.append(make_step("DELETE_RECORD",o.system_id,o.resource_id,""))
+                verifications.append(make_step("VERIFY_RECORD_ABSENT",o.system_id,o.resource_id,""))
+            else:
+                verifications.append(make_step("VERIFY_RECORD_ABSENT",o.system_id,o.resource_id,o.file_id))
+        elif action=="REDACT":
+            exposed=is_pii_exposed(o,emails,phones,aliases)
+            if exposed:
+                findings.append(make_step("REPORT_EXPOSED_PII",o.system_id,o.resource_id,o.file_id))
+                remediation.append(make_step("REDACT_RECORD",o.system_id,o.resource_id,""))
+                verifications.append(make_step("VERIFY_RECORD_REDACTED",o.system_id,o.resource_id,""))
+            else:
+                verifications.append(make_step("VERIFY_RECORD_REDACTED",o.system_id,o.resource_id,o.file_id))
+        elif action=="ANONYMIZE":
+            exposed=is_pii_exposed(o,emails,phones,aliases) or bool(field_value(o.fields,("user_id","customer_reference")))
+            if exposed:
+                findings.append(make_step("REPORT_EXPOSED_PII",o.system_id,o.resource_id,o.file_id))
+                remediation.append(make_step("ANONYMIZE_RECORD",o.system_id,o.resource_id,""))
+                verifications.append(make_step("VERIFY_RECORD_ANONYMIZED",o.system_id,o.resource_id,""))
+            else:
+                verifications.append(make_step("VERIFY_RECORD_ANONYMIZED",o.system_id,o.resource_id,o.file_id))
+        elif action=="RETAIN":
+            if o.category=="BACKUP_ARCHIVE":
+                allowed=field_value(o.fields,("restore_allowed",))
+                if str(allowed).casefold() in ("1","true","yes","active") or o.explicit_state=="ACTIVE":
+                    findings.append(make_step("REPORT_RESTORE_RISK",o.system_id,o.resource_id,o.file_id))
+                    remediation.append(make_step("BLOCK_RESTORE",o.system_id,o.resource_id,""))
+                    verifications.append(make_step("VERIFY_RESTORE_BLOCKED",o.system_id,o.resource_id,""))
+                else: verifications.append(make_step("VERIFY_RESTORE_BLOCKED",o.system_id,o.resource_id,o.file_id))
+            else: verifications.append(make_step("VERIFY_RECORD_PRESENT",o.system_id,o.resource_id,o.file_id))
+        if o.category in ("integration_service",) or o.system_id=="integration_service":
+            enabled=field_value(o.fields,("enabled","is_enabled","active"))
+            if str(enabled).casefold() in ("1","true","yes","active") or o.explicit_state=="ACTIVE":
+                findings.append(make_step("REPORT_ACTIVE_DATA_FLOW",o.system_id,o.resource_id,o.file_id))
+                remediation.append(make_step("DISABLE_DATA_FLOW",o.system_id,o.resource_id,""))
+                verifications.append(make_step("VERIFY_DATA_FLOW_DISABLED",o.system_id,o.resource_id,""))
+            elif str(enabled).casefold() in ("0","false","no","disabled") or o.explicit_state=="DISABLED":
+                verifications.append(make_step("VERIFY_DATA_FLOW_DISABLED",o.system_id,o.resource_id,o.file_id))
+    # Add relevant global activity as recreation-risk evidence when it is explicitly tied to an already identified resource.
+    res_ids={o.resource_id for o in resources}
+    for a in activities:
+        at=parse_dt(a.get('event_time'))
+        if parse_dt(audit_at) and at and at>parse_dt(audit_at): continue
+        rid=a.get('resource_id','')
+        if rid not in res_ids: continue
+        et=a.get('event_type','').upper(); result=a.get('reported_result','').upper(); details=a.get('details','').casefold()
+        if et in ('CHECK_DATA_FLOW','SYNC_RECORD','INDEX_RECORD') and ('enabled' in details or 'remains active' in details):
+            o=next((x for x in resources if x.resource_id==rid),None)
+            if o and not any(s['resource_id']==rid and s['operation']=='REPORT_ACTIVE_DATA_FLOW' for s in findings):
+                findings.append(make_step('REPORT_ACTIVE_DATA_FLOW',o.system_id,rid,a['activity_id']))
+                remediation.append(make_step('DISABLE_DATA_FLOW',o.system_id,rid,'')); verifications.append(make_step('VERIFY_DATA_FLOW_DISABLED',o.system_id,rid,''))
+        if et=='CHECK_RESTORE_ACCESS' and ('can still be restored' in details or 'restore access' in details):
+            o=next((x for x in resources if x.resource_id==rid),None)
+            if o and not any(s['resource_id']==rid and s['operation']=='REPORT_RESTORE_RISK' for s in findings):
+                findings.append(make_step('REPORT_RESTORE_RISK',o.system_id,rid,a['activity_id']))
+                remediation.append(make_step('BLOCK_RESTORE',o.system_id,rid,'')); verifications.append(make_step('VERIFY_RESTORE_BLOCKED',o.system_id,rid,''))
+    # Always verify the primary account state when a relevant account resource is known.
+    if account_resources:
+        for o in account_resources:
+            if not any(s['resource_id']==o.resource_id and s['operation']=='VERIFY_RECORD_ABSENT' for s in verifications):
+                verifications.append(make_step('VERIFY_RECORD_ABSENT',o.system_id,o.resource_id,"" if findings else o.file_id))
+    # Deduplicate exact semantic steps; retain the strongest evidence source for each finding.
+    def dedupe(items):
+        result={}
+        for s in items:
+            k=(s['operation'],s['system_id'],s['resource_id'])
+            if k not in result or (not result[k]['evidence_id'] and s['evidence_id']): result[k]=s
+        return list(result.values())
+    findings,remediation,verifications=map(dedupe,(findings,remediation,verifications))
+    # Complete cases require evidence-backed verification only. Incomplete cases have future steps with empty evidence IDs.
+    status="INCOMPLETE" if findings else "COMPLETE"
+    if status=="INCOMPLETE":
+        for s in remediation+verifications: s['evidence_id']=""
+        steps=findings+remediation+verifications
+    else:
+        steps=verifications
+        for s in steps:
+            if not s['evidence_id']:
+                # No unsupported completion claim: if verification evidence is unavailable, classify as incomplete.
+                status="INCOMPLETE"
+        if status=="INCOMPLETE":
+            for s in findings+remediation+verifications: s['evidence_id']=""
+            steps=findings+remediation+verifications
+    steps=sort_steps(steps)
+    return {"case_id":case_id,"deletion_status":status,"steps_json":json.dumps(steps,ensure_ascii=False,separators=(",",":"))}
+
+
+def validate_output(path: Path, requests: list[dict[str,str]]) -> list[str]:
+    errors=[]; rows=read_csv(path)
+    if rows and list(rows[0].keys()) != ["case_id","deletion_status","steps_json"]: errors.append("Incorrect output header/column order")
+    if len(rows)!=len(requests): errors.append(f"Expected {len(requests)} data rows; got {len(rows)}")
+    expected=sorted(r['case_id'] for r in requests)
+    actual=[r.get('case_id','') for r in rows]
+    if actual!=expected: errors.append("case_id rows are missing, duplicated, or not sorted")
+    allowed={"COMPLETE","INCOMPLETE","NOT_APPLICABLE"}
+    valid_evidence=set()
+    for filename, key in (("evidence_files.csv","file_id"),("system_activity.csv","activity_id"),("user_audit_log.csv","audit_id")):
+        source=path.parent/"dataset"/filename
+        if source.exists():
+            try: valid_evidence.update(x.get(key,"") for x in read_csv(source))
+            except Exception: pass
+    for row in rows:
+        if row.get('deletion_status') not in allowed: errors.append(f"{row.get('case_id')}: invalid status")
+        try: steps=json.loads(row.get('steps_json',''))
+        except Exception: errors.append(f"{row.get('case_id')}: invalid JSON"); continue
+        if not isinstance(steps,list): errors.append(f"{row.get('case_id')}: steps_json is not array"); continue
+        if row['deletion_status']=="NOT_APPLICABLE" and steps: errors.append(f"{row['case_id']}: NOT_APPLICABLE must have []")
+        if row['deletion_status']=="COMPLETE" and any(s.get('phase')!="VERIFICATION" for s in steps): errors.append(f"{row['case_id']}: COMPLETE contains non-verification step")
+        for i,s in enumerate(steps,1):
+            if set(s)!=set(("step_no","phase","system_id","resource_id","operation","state","evidence_id")): errors.append(f"{row['case_id']}: invalid step fields")
+            if s.get('step_no')!=i: errors.append(f"{row['case_id']}: non-consecutive step numbers")
+            if s.get('operation') not in OP_STATE or (s.get('phase'),s.get('state'))!=OP_STATE.get(s.get('operation')): errors.append(f"{row['case_id']}: invalid operation/phase/state")
+    return errors
+
+
+def run(request_path: Path = DATASET/"deletion_requests.csv", output_path: Path = OUTPUT) -> int:
+    requests=read_csv(request_path)
+    identities=read_csv(DATASET/"user_identities.csv")
+    audits=read_csv(DATASET/"user_audit_log.csv")
+    activities=read_csv(DATASET/"system_activity.csv")
+    rules=read_csv(DATASET/"deletion_rules.csv")
+    LOG.info("Loading evidence corpus from %s", DATASET/"evidence")
+    observations,manifest=build_observations(DATASET)
+    LOG.info("Loaded %d requests, %d identity rows, %d activities, %d evidence observations",len(requests),len(identities),len(activities),len(observations))
+    rows=[case_output(r,observations,identities,audits,activities,rules) for r in requests]
+    rows.sort(key=lambda r:r['case_id'])
+    output_path.parent.mkdir(parents=True,exist_ok=True)
+    with output_path.open('w',encoding='utf-8',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=['case_id','deletion_status','steps_json'],lineterminator='\n'); w.writeheader(); w.writerows(rows)
+    errors=validate_output(output_path,requests)
+    if errors:
+        for e in errors[:30]: LOG.error(e)
+        LOG.error("Structural validation failed with %d errors",len(errors)); return 2
+    LOG.info("Wrote %d rows to %s; structural validation passed",len(rows),output_path)
+    return 0
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO,format='%(levelname)s %(message)s')
+    try: sys.exit(run())
+    except Exception:
+        LOG.exception("Audit run failed"); sys.exit(1)
